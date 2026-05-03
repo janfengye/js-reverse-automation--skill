@@ -42,7 +42,7 @@ Phase 0 的输入会被规范化为如下 JSON 结构：
     }
   },
   "evidence": [
-    "XHR breakpoint hit before request dispatch"
+    "page-side XHR/send observation captured the request before dispatch"
   ]
 }
 ```
@@ -58,8 +58,8 @@ Phase 0 的输入会被规范化为如下 JSON 结构：
         "path": "window.loginVm.encryptPassword",
         "source_hint": "app.bundle.js:12031",
         "evidence": [
-          "call stack frame matched request replay",
-          "hook output captured plaintext and ciphertext"
+          "page-side stack output matched the request construction path",
+          "observation code captured plaintext and ciphertext"
         ]
       },
       "candidates": []
@@ -100,7 +100,7 @@ Phase 0 的输入会被规范化为如下 JSON 结构：
 {
   "skill": {
     "name": "js-reverse-automation",
-    "version": "2.0.0"
+    "version": "1.3.0"
   },
   "input": {},
   "trace": {},
@@ -148,6 +148,8 @@ Phase 0 的输入会被规范化为如下 JSON 结构：
 - 每个参数都必须定义 `entrypoint.type`、`entrypoint.path` 或 `entrypoint.resolver_name`、`call_signature.async`，以及 `runtime.bind_this_path` 或 `runtime.bind_this_mode`。
 - `jsrpc.action_name` 必须是确定性的，并与生成文件中的值一致。
 - `diagnostics.status` 必须是 `ready`、`partial` 或 `failed` 之一。
+- `trace` 中必须保留足够的请求级证据，至少能说明目标请求的 URL、方法、参数落点和关键证据来源。
+- 如果使用了反检测 patch，`diagnostics.warnings` 或 `diagnostics.residual_risks` 中必须记录 patch 类型、影响范围和是否仅用于观察。
 
 ## 生成产物契约
 

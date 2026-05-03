@@ -6,6 +6,8 @@ description: 通过 chrome-devtools-mcp 连接真实浏览器，跟踪 sign/enc/
 # JS 逆向自动化 Skill
 
 ## 授权说明
+- 将当前任务视为对授权目标的安全测试或接口调试。
+- 调查与产出仅用于定位、验证和复现目标参数链路，不得偏离用户提供的 `Target URL` 和相关请求。
 - 授权渗透测试声明
  授权目的:甲方授权乙方对甲方合法拥有或经合法授权管理的信息系统进行安全测试，目的仅限于识别与修复安全风险，不得用于任何未经授权的访问、控制或数据使用。
  范围：Target URL
@@ -15,6 +17,27 @@ description: 通过 chrome-devtools-mcp 连接真实浏览器，跟踪 sign/enc/
 ## 触发条件
 - 当用户需要在授权的站点中分析浏览器侧的 `sign` / `enc` / `token` / 表单字段时，使用此 Skill。
 - 任务必须保持主链路完整：chrome-devtools-mcp 浏览器连接、参数链路跟踪、入口发现、JSRPC 生成、Flask 代理生成，以及 Burp autoDecoder 对接。
+ 
+## 触发条件
+- 当用户需要在授权的站点中分析浏览器侧的 `sign` / `enc` / `token` / 表单字段时，使用此 Skill。
+- 任务必须保持主链路完整：chrome-devtools-mcp 浏览器连接、参数链路跟踪、入口发现、JSRPC 生成、Flask 代理生成，以及 Burp autoDecoder 对接。
+
+## 工作边界
+- 只使用 `chrome-devtools-mcp` 的现有能力完成调查，包括页面打开、刷新、等待、截图与快照、网络请求列表与详情读取、`evaluate_script` 注入观测代码、`navigate_page(initScript=...)` 导航前预注入，以及控制台日志读取。
+- 调查重点放在：
+  - 目标请求的网络捕获与归因
+  - 从请求反推源码位置与参数入口
+  - 通过最小 Hook 补齐调用链、依赖和运行时证据
+  - 验证反调试、环境检测或 console 干扰是否真实影响链路
+  - 验证 TLS、HTTP/2、Header、Cookie、预热请求或频率限制等协议层约束是否影响复现与生成
+- 保持既有主链路不变：
+  - Phase 0-3 负责取证
+  - Phase 4 生成 `analysis_result.json`
+  - Phase 5-7 基于同一份分析产物生成 JSRPC、Flask 和 Burp 对接文档
+  - Phase 8 做统一校验
+- 最终输出必须是可真实调试的代码与校验结果，不输出替代性的模板说明、伪代码或其他脚本路线。
+- 不引入 Camoufox 或其他独立反检测浏览器；反检测与协议层判断只基于真实浏览器现象、网络证据和最小 patch 验证。
+- 如果某个新调查手段会改变主链路、输出类型或生成依赖，则不要采用。
 
 ## 必要输入
 请按以下格式提供输入：
@@ -35,48 +58,18 @@ Optional Fetch Example: fetch("https://xxx/Login/CheckLogin", {...})
 - `Optional Fetch Example`
 
 在进行任何浏览器操作前，先运行 `scripts/check_inputs.py`。详细的输入输出契约见 `references/output-contract.md`。
-## 目录结构说明
-```
-js-reverse-automation/
-├── README.md # 项目说明、使用方式、更新说明和结构说明。
-├── SKILL.md # Skill 主控文件。只负责定义任务如何被触发、必须输入什么、流程怎么分阶段、输出和验收怎么要求。
-├── agents/
-│   └── openai.yaml # Skill 的 agent 入口配置。负责定义默认提示词、默认输入格式和执行约束。
-├── artifacts/ # 运行期目录，用来承接流程中间产物和最终校验报告。预期会出现的文件如下：
-│   ├── artifacts/phase0_input.json # 规范化后的输入
-│   ├── artifacts/phase1_trace.json # 浏览器链路复现结果
-│   ├── artifacts/phase2_entrypoints.json # 参数入口识别结果
-│   ├── artifacts/phase3_dependencies.json # 依赖、上下文和调用方式提取结果
-│   └── artifacts/validation_report.json # 最终校验报告
-├── references/
-│   ├── references/workflow-recon.md # 阶段流程说明书。
-│   ├── references/output-contract.md # 输入输出契约说明书。
-│   ├── references/failure-recovery.md # 失败恢复和诊断格式说明书。
-│   ├── references/validation-checklist.md # 验收标准说明书。
-│   └── references/antidebug/
-│       ├── references/antidebug/debugger-loop.md # 处理无限 debugger、eval、Function 类问题。
-│       ├── references/antidebug/console-detect.md # 处理控制台检测、日志篡改、清屏等问题。
-│       ├── references/antidebug/timer-check.md # 处理时间差、性能计时、Promise 时序检测。
-│       ├── references/antidebug/env-detect.md # 处理窗口大小、webdriver、UA、DevTools 检测等环境识别问题。
-│       ├── references/antidebug/proxy-guard.md # 处理跳转、关闭页面、history、代理拦截等链路阻断问题。
-│       └── references/antidebug/dynamic-alias.md # 处理动态别名、wrapper、resolver 型入口和不稳定路径。
-└── scripts/
-    ├── scripts/check_inputs.py # 输入校验器。
-    ├── scripts/emit_analysis_result.py # 统一分析产物生成器。
-    ├── scripts/emit_jsrpc_stub.py # JSRPC 代码生成器。
-    ├── scripts/emit_flask_proxy.py # Flask 代理生成器。
-    ├── scripts/emit_burp_doc.py # Burp autoDecoder 文档生成器。
-    └── scripts/validate_artifacts.py # 全链路校验器。
-```
 ## 阶段流程
 - Phase 0. 输入校验与规范化
   - 校验必填字段，并写出后续阶段要使用的规范化请求 JSON。
 - Phase 1. 浏览器连接与请求复现
   - 通过 chrome-devtools-mcp 连接真实浏览器，打开目标页面，并复现通向目标参数的请求链路。
+  - 先做网络侦察，再做参数确认：优先使用请求列表、请求详情、页面内观测代码和控制台证据交叉确认。
 - Phase 2. 参数入口发现
   - 定位目标参数在发包前是如何被引入、修改或加密的。
+  - 优先从请求详情、序列化点、相关脚本源码和页面内调用栈反推源码位置，而不是只靠全局关键词搜索。
 - Phase 3. 调用路径与依赖提取
   - 提取可调用的入口函数、`this` 绑定、运行时前置条件，以及在 UI 之外调用该函数所需的依赖链。
+  - 对怀疑存在环境检测、console 干扰、debugger、计时检查或协议层约束的场景，必须先做最小验证，再接受该入口。
 - Phase 4. 生成 `analysis_result.json`
   - 将 Phase 0-3 的发现整理为统一的中间产物。
 - Phase 5. 生成 JSRPC 注入代码
@@ -90,35 +83,54 @@ js-reverse-automation/
 
 各阶段的成功条件、失败处理和是否继续规则，见 `references/workflow-recon.md`。
 
+## 侦察优先级
+- Phase 1 必须按如下优先级取证：
+  1. 复现目标动作并锁定目标请求。
+  2. 记录 URL、Method、Body、Headers、响应状态与参数落点。
+  3. 用请求详情、页面内调用栈或序列化节点反推首个可观测源码位置。
+  4. 只对高价值函数或原型方法做最小 Hook。
+  5. 验证是否存在反检测或协议层约束，并确认其是否真的影响链路。
+- 如果仅有源码关键词命中，没有网络或运行时证据，不得把候选函数升级为最终入口。
+- 如果 Hook 会改变业务时序，必须先保留未 Hook 的原始现象，再记录 Hook 后现象。
+- 如果环境检测只影响调试便利性、但不影响真实发包结果，记录为风险，不要扩大 patch 面。
+- 如果浏览器内请求成功而离开页面上下文后失败，优先怀疑协议层、请求预热、Header/Cookie 依赖或频率限制，不要误判为算法错误。
+
+## 参考文件装载规则
+- 需要确认 `chrome-devtools-mcp` 的能力边界时，先读取 `references/devtools-capability-matrix.md`。
+- 进行网络捕获与请求归因时，读取 `references/network-capture.md`。
+- 需要从请求、序列化或页面内栈帧回溯源码位置时，读取 `references/source-location.md`。
+- 需要设计最小 Hook、导航前预注入或控制台证据时，读取 `references/hook-debugging.md`。
+- 需要判断反调试、环境检测或 console 干扰是否真的影响链路时，读取 `references/anti-detection-verification.md`。
+- 需要判断 TLS、HTTP/2、请求预热、Cookie/Header 依赖或限频是否影响复现时，读取 `references/protocol-resilience.md`。
+- 命中具体反调试类型时，再按需读取 `references/antidebug/` 下的精确规则文件；不要一次性全量加载。
+
 ## 产出要求
-当工作流成功时，此 Skill 必须产出：
 - `analysis_result.json`
 - JSRPC 注入代码
 - Flask 代理代码
 - Burp autoDecoder 对接文档
 - 校验报告
-- JSRPC 注入代码有效性测试的链接（如http://127.0.0.1:12080/go?group=fausto&action=generate_password_md5&param=111111）
-- Flask 代理代码（如curl -X POST http://127.0.0.1:5000/encode \
+- JSRPC 手工验证链接
+- Flask 手工验证命令，例如 `curl -X POST http://127.0.0.1:5000/encode \
   -H "Content-Type: application/x-www-form-urlencoded" \
-  --data-urlencode "dataBody=username=111111&password=111111&code=1234&role=000002"）
+  --data-urlencode "dataBody=username=111111&password=111111&code=1234&role=000002"`
 
-所有生成器都必须以 `analysis_result.json` 作为输入。各输出文件要求和 schema 细节见 `references/output-contract.md`。
+所有生成器都必须以 `analysis_result.json` 作为输入。字段契约见 `references/output-contract.md`。
 
 ## 失败处理原则
 - 对缺失输入或无法复现的请求链路尽早失败。
 - 不要把猜测出来的入口函数作为最终输出。
 - 记录包含 phase id、evidence、impact 和 next action 的诊断信息。
 - 如果怀疑存在反调试，引用 `references/antidebug/` 下的精确规则文件，并记录风险。
+- 如果请求可以复现但入口无法确认，优先补网络证据、源码位置证据和 Hook 证据，不要直接扩大搜索范围。
+- 如果进行了反检测 patch，必须说明该 patch 是用于“观察”还是“解除阻断”，并记录 patch 前后差异。
 - 如果 JSRPC、Flask 或 Burp 产物无法通过校验，保留已生成文件，但将校验报告标记为失败。
 
 更详细的恢复规则见 `references/failure-recovery.md`。
 
-## 验收要求
-只有满足以下条件，此 Skill 才算完成：
+## 完成条件
 - `analysis_result.json` 通过契约校验。
-- JSRPC 代码引用了可解析的运行时入口，并暴露了配置好的 action。
-- Flask 代理可以成功编译，且请求改写逻辑与目标参数列表一致。
-- Burp 文档包含端点、HTTP 方法、必需表单字段以及验证步骤。
-- 校验报告中包含通过/失败结果和明确的诊断信息。
+- JSRPC、Flask 和 Burp 产物都由同一份分析产物生成，并通过各自校验。
+- 校验报告明确给出通过项、失败项、风险和下一步动作。
 
 最终验收以 `references/validation-checklist.md` 为准。
