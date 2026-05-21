@@ -66,17 +66,43 @@ def build_script(analysis: dict) -> str:
     }}, root);
   }}
 
+  function parentPath(path) {{
+    if (!path) return '';
+    var parts = path.split('.');
+    parts.pop();
+    return parts.join('.');
+  }}
+
   function resolveEntrypoint(parameterConfig) {{
     var entrypoint = parameterConfig.entrypoint || {{}};
     if (entrypoint.type === 'resolver') {{
-      var resolverPath = entrypoint.resolver_path || '';
+      var resolverPath = entrypoint.resolver_path || entrypoint.resolver_name || '';
       var resolver = getByPath(window, resolverPath);
       if (typeof resolver === 'function') {{
-        return resolver();
+        var resolved = resolver();
+        if (typeof resolved === 'string') {{
+          return getByPath(window, resolved);
+        }}
+        return resolved;
       }}
       return null;
     }}
     return getByPath(window, entrypoint.path || '');
+  }}
+
+  function resolveThis(parameterConfig) {{
+    var runtime = parameterConfig.runtime || {{}};
+    if (runtime.bind_this_path) {{
+      return getByPath(window, runtime.bind_this_path);
+    }}
+    var mode = runtime.bind_this_mode || '';
+    if (mode === 'window' || mode === 'global') {{
+      return window;
+    }}
+    if (mode === 'entrypoint_parent') {{
+      return getByPath(window, parentPath((parameterConfig.entrypoint || {{}}).path || ''));
+    }}
+    return null;
   }}
 
   function normalizeInput(payload) {{
@@ -130,8 +156,7 @@ def build_script(analysis: dict) -> str:
         throw new Error('Entrypoint is not callable for parameter: ' + parameter);
       }}
 
-      var bindThisPath = (parameterConfig.runtime || {{}}).bind_this_path || null;
-      var ctx = bindThisPath ? getByPath(window, bindThisPath) : null;
+      var ctx = resolveThis(parameterConfig);
       var args = Array.isArray(payload.args) ? payload.args.map(coerceArg) : [coerceArg(payload.value)];
       var result = fn.apply(ctx, args);
 

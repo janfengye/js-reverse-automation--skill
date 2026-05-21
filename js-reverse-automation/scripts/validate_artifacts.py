@@ -41,6 +41,34 @@ def record(
         failures.append({"check": name, "detail": failure_detail})
 
 
+def non_empty_string(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def has_runtime_binding(runtime: dict) -> bool:
+    return non_empty_string(runtime.get("bind_this_path")) or non_empty_string(
+        runtime.get("bind_this_mode")
+    )
+
+
+def valid_bind_this_mode(runtime: dict) -> bool:
+    mode = runtime.get("bind_this_mode")
+    if mode is None:
+        return True
+    return mode in {"window", "global", "entrypoint_parent", "none", "null"}
+
+
+def has_entrypoint_locator(entrypoint: dict) -> bool:
+    entrypoint_type = entrypoint.get("type")
+    if entrypoint_type == "resolver":
+        return non_empty_string(entrypoint.get("resolver_path")) or non_empty_string(
+            entrypoint.get("resolver_name")
+        )
+    return non_empty_string(entrypoint.get("path")) or non_empty_string(
+        entrypoint.get("resolver_name")
+    )
+
+
 def main() -> int:
     args = parse_args()
     analysis_path = Path(args.analysis)
@@ -81,41 +109,153 @@ def main() -> int:
 
     requested_parameters = analysis.get("input", {}).get("parameters", [])
     parameters = analysis.get("parameters", {})
-    for parameter in requested_parameters:
+    requested_iter = requested_parameters if isinstance(requested_parameters, list) else []
+    parameter_map = parameters if isinstance(parameters, dict) else {}
+    record(
+        checks,
+        failures,
+        "analysis:input:parameters",
+        isinstance(requested_parameters, list) and bool(requested_parameters),
+        "input parameters list is present",
+        "analysis.input.parameters must be a non-empty list",
+    )
+    record(
+        checks,
+        failures,
+        "analysis:parameters-object",
+        isinstance(parameters, dict),
+        "parameters object is present",
+        "analysis.parameters must be a JSON object",
+    )
+    for parameter in requested_iter:
         record(
             checks,
             failures,
             f"analysis:parameter:{parameter}",
-            parameter in parameters,
+            parameter in parameter_map,
             f"parameter contract present: {parameter}",
             f"missing parameter contract for {parameter}",
         )
-        if parameter in parameters:
-            parameter_contract = parameters[parameter]
+        if parameter in parameter_map:
+            parameter_contract = parameter_map[parameter]
+            entrypoint = parameter_contract.get("entrypoint")
+            call_signature = parameter_contract.get("call_signature")
+            runtime = parameter_contract.get("runtime")
             record(
                 checks,
                 failures,
                 f"analysis:parameter:{parameter}:entrypoint",
-                isinstance(parameter_contract.get("entrypoint"), dict),
+                isinstance(entrypoint, dict),
                 f"entrypoint contract present for {parameter}",
                 f"missing entrypoint contract for {parameter}",
             )
+            if isinstance(entrypoint, dict):
+                record(
+                    checks,
+                    failures,
+                    f"analysis:parameter:{parameter}:entrypoint-type",
+                    non_empty_string(entrypoint.get("type")),
+                    f"entrypoint type present for {parameter}",
+                    f"missing entrypoint.type for {parameter}",
+                )
+                record(
+                    checks,
+                    failures,
+                    f"analysis:parameter:{parameter}:entrypoint-locator",
+                    has_entrypoint_locator(entrypoint),
+                    f"entrypoint locator present for {parameter}",
+                    (
+                        "entrypoint must define path, resolver_name, or resolver_path "
+                        f"for {parameter}"
+                    ),
+                )
             record(
                 checks,
                 failures,
                 f"analysis:parameter:{parameter}:call-signature",
-                isinstance(parameter_contract.get("call_signature"), dict),
+                isinstance(call_signature, dict),
                 f"call signature present for {parameter}",
                 f"missing call signature for {parameter}",
             )
+            if isinstance(call_signature, dict):
+                record(
+                    checks,
+                    failures,
+                    f"analysis:parameter:{parameter}:call-signature-async",
+                    isinstance(call_signature.get("async"), bool),
+                    f"call_signature.async present for {parameter}",
+                    f"call_signature.async must be boolean for {parameter}",
+                )
             record(
                 checks,
                 failures,
                 f"analysis:parameter:{parameter}:runtime",
-                isinstance(parameter_contract.get("runtime"), dict),
+                isinstance(runtime, dict),
                 f"runtime contract present for {parameter}",
                 f"missing runtime contract for {parameter}",
             )
+            if isinstance(runtime, dict):
+                record(
+                    checks,
+                    failures,
+                    f"analysis:parameter:{parameter}:runtime-binding",
+                    has_runtime_binding(runtime),
+                    f"runtime binding present for {parameter}",
+                    (
+                        "runtime must define bind_this_path or bind_this_mode "
+                        f"for {parameter}"
+                    ),
+                )
+                record(
+                    checks,
+                    failures,
+                    f"analysis:parameter:{parameter}:runtime-bind-mode",
+                    valid_bind_this_mode(runtime),
+                    f"runtime bind mode valid for {parameter}",
+                    (
+                        "runtime.bind_this_mode must be one of window, global, "
+                        f"entrypoint_parent, none, null for {parameter}"
+                    ),
+                )
+
+    trace = analysis.get("trace", {})
+    request_replay = trace.get("request_replay", {}) if isinstance(trace, dict) else {}
+    evidence = trace.get("evidence", []) if isinstance(trace, dict) else []
+    record(
+        checks,
+        failures,
+        "analysis:trace:request-url",
+        isinstance(request_replay, dict) and non_empty_string(request_replay.get("request_url")),
+        "trace request URL present",
+        "trace.request_replay.request_url is required",
+    )
+    record(
+        checks,
+        failures,
+        "analysis:trace:method",
+        isinstance(request_replay, dict) and non_empty_string(request_replay.get("method")),
+        "trace method present",
+        "trace.request_replay.method is required",
+    )
+    parameter_locations = (
+        request_replay.get("parameter_locations", {}) if isinstance(request_replay, dict) else {}
+    )
+    record(
+        checks,
+        failures,
+        "analysis:trace:parameter-locations",
+        isinstance(parameter_locations, dict) and bool(parameter_locations),
+        "trace parameter locations present",
+        "trace.request_replay.parameter_locations must be a non-empty object",
+    )
+    record(
+        checks,
+        failures,
+        "analysis:trace:evidence",
+        isinstance(evidence, list) and bool(evidence),
+        "trace evidence present",
+        "trace.evidence must be a non-empty list",
+    )
 
     diagnostics_status = analysis.get("diagnostics", {}).get("status")
     record(

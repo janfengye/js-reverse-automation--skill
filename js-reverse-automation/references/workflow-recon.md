@@ -179,7 +179,29 @@
 - 失败条件
   - 任一必需检查失败。
 - 是否继续
-  - `no`
+  - `yes`，进入 Phase 9，记录成功或失败经验。
 - 失败处理
-  - 将校验报告作为最终状态对象返回。
+  - 将校验报告作为 Phase 8 状态对象写出。
   - 包含 phase id、失败文件、失败规则以及建议的下一步动作。
+  - 继续进入 Phase 9，以便沉淀失败策略并执行记忆失效降级。
+
+## Phase 9: 经验沉淀与对抗库演进
+
+- 输入
+  - `artifacts/phase0_input.json`
+  - `analysis_result.json`
+  - `artifacts/validation_report.json`
+- 输出
+  - 更新后的 `references/evolution_matrix.json`
+- 成功条件
+  - 成功提取域名特征、最新成功 Action 命名并写入或更新 `domains`。
+  - 若任务期间触发了 `references/antidebug/` 规则或发生了修复重试，成功提取代码特征、阻断关键字并归纳写入 `behavioral_features`。更新对应的 `updated_at` 时间戳，并使 `success_count` 加 1。
+  - 成功沉淀可复用 STE 经验：`strategic_principle`（战略原则）、`tactical_manual`（战术手册）和 `applicable_scenarios`（适用场景）。
+  - 若属于历史成功策略本次失效的情况，成功将该方案移入 `failed_attempts`。
+- 失败条件
+  - 覆写导致历史其他域名的记忆丢失。
+  - 写入中途进程中断导致 JSON 文件损坏。
+- 是否继续
+  - `no`（工作流终点）。
+- 失败处理
+  - 记录合并错误日志，保持原记忆文件不损坏。

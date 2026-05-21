@@ -145,7 +145,8 @@ Phase 0 的输入会被规范化为如下 JSON 结构：
 强制规则：
 - `skill`、`input`、`trace`、`parameters`、`jsrpc`、`flask`、`burp`、`diagnostics`、`validation_targets` 必须全部存在。
 - `parameters` 必须覆盖 Phase 0 中请求的每一个参数。
-- 每个参数都必须定义 `entrypoint.type`、`entrypoint.path` 或 `entrypoint.resolver_name`、`call_signature.async`，以及 `runtime.bind_this_path` 或 `runtime.bind_this_mode`。
+- 每个参数都必须定义 `entrypoint.type`、`entrypoint.path` 或 `entrypoint.resolver_name` / `entrypoint.resolver_path`、`call_signature.async`，以及 `runtime.bind_this_path` 或 `runtime.bind_this_mode`。
+- `runtime.bind_this_mode` 支持 `window`、`global`、`entrypoint_parent`、`none` 或 `null`；未指定 `bind_this_path` 时生成器按该模式决定 `this` 绑定。
 - `jsrpc.action_name` 必须是确定性的，并与生成文件中的值一致。
 - `diagnostics.status` 必须是 `ready`、`partial` 或 `failed` 之一。
 - `trace` 中必须保留足够的请求级证据，至少能说明目标请求的 URL、方法、参数落点和关键证据来源。
@@ -198,3 +199,42 @@ Phase 0 的输入会被规范化为如下 JSON 结构：
   - `warnings`
   - `failures`
   - `next_actions`
+
+## Phase 9 经验库契约：`references/evolution_matrix.json`
+
+最低要求结构如下：
+
+```json
+{
+  "domains": {
+    "example.com": {
+      "last_action_name": "generate_password",
+      "route": "/encode",
+      "last_behavioral_features": ["dynamic_resolver_export"],
+      "last_validation_fingerprint": "sha256:...",
+      "updated_at": "2026-05-21",
+      "notes": "resolver patch used"
+    }
+  },
+  "behavioral_features": {
+    "dynamic_resolver_export": {
+      "fingerprint_keywords": ["resolver", "resolver_path", "resolver_name"],
+      "successful_patch_strategy": "使用 resolver 策略定位动态导出的运行时入口",
+      "failed_attempts": [],
+      "success_count": 1,
+      "ste": {
+        "strategic_principle": "入口路径不稳定时，优先沉淀 resolver 而不是沉淀静态对象路径。",
+        "tactical_manual": [],
+        "applicable_scenarios": ["dynamic-resolver"]
+      },
+      "updated_at": "2026-05-21"
+    }
+  }
+}
+```
+
+规则：
+- `domains` 和 `behavioral_features` 必须始终是 JSON object。
+- 更新必须是增量合并，不能覆盖无关域名或无关特征。
+- 写入必须使用文件锁和原子替换，防止并发或异常中断损坏文件。
+- `success_count` 只统计新的校验指纹，重复运行同一份产物不能重复递增。

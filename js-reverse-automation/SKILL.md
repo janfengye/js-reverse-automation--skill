@@ -17,10 +17,6 @@ description: 通过 chrome-devtools-mcp 连接真实浏览器，跟踪 sign/enc/
 ## 触发条件
 - 当用户需要在授权的站点中分析浏览器侧的 `sign` / `enc` / `token` / 表单字段时，使用此 Skill。
 - 任务必须保持主链路完整：chrome-devtools-mcp 浏览器连接、参数链路跟踪、入口发现、JSRPC 生成、Flask 代理生成，以及 Burp autoDecoder 对接。
- 
-## 触发条件
-- 当用户需要在授权的站点中分析浏览器侧的 `sign` / `enc` / `token` / 表单字段时，使用此 Skill。
-- 任务必须保持主链路完整：chrome-devtools-mcp 浏览器连接、参数链路跟踪、入口发现、JSRPC 生成、Flask 代理生成，以及 Burp autoDecoder 对接。
 
 ## 工作边界
 - 只使用 `chrome-devtools-mcp` 的现有能力完成调查，包括页面打开、刷新、等待、截图与快照、网络请求列表与详情读取、`evaluate_script` 注入观测代码、`navigate_page(initScript=...)` 导航前预注入，以及控制台日志读取。
@@ -35,6 +31,7 @@ description: 通过 chrome-devtools-mcp 连接真实浏览器，跟踪 sign/enc/
   - Phase 4 生成 `analysis_result.json`
   - Phase 5-7 基于同一份分析产物生成 JSRPC、Flask 和 Burp 对接文档
   - Phase 8 做统一校验
+  - Phase 9 只做经验库增量合并，不改变 Phase 0-8 的代码生成路径
 - 最终输出必须是可真实调试的代码与校验结果，不输出替代性的模板说明、伪代码或其他脚本路线。
 - 不引入 Camoufox 或其他独立反检测浏览器；反检测与协议层判断只基于真实浏览器现象、网络证据和最小 patch 验证。
 - 如果某个新调查手段会改变主链路、输出类型或生成依赖，则不要采用。
@@ -80,6 +77,9 @@ Optional Fetch Example: fetch("https://xxx/Login/CheckLogin", {...})
   - 基于同一份分析产物生成 autoDecoder 对接说明文档。
 - Phase 8. 校验与诊断
   - 运行 `scripts/validate_artifacts.py`，生成包含通过/失败明细与修复建议的校验报告。
+- Phase 9. 经验沉淀与对抗库演进
+  - 复盘当前任务的输入、分析产物与校验报告，提取目标站点的混淆特征、反调试阻断症状及成功的 Patch 代码。
+  - 运行 `scripts/update_evolution_library.py` 将新知识增量合并至 `references/evolution_matrix.json`。
 
 各阶段的成功条件、失败处理和是否继续规则，见 `references/workflow-recon.md`。
 
@@ -96,6 +96,8 @@ Optional Fetch Example: fetch("https://xxx/Login/CheckLogin", {...})
 - 如果浏览器内请求成功而离开页面上下文后失败，优先怀疑协议层、请求预热、Header/Cookie 依赖或频率限制，不要误判为算法错误。
 
 ## 参考文件装载规则
+
+### 0. 基础参考装载
 - 需要确认 `chrome-devtools-mcp` 的能力边界时，先读取 `references/devtools-capability-matrix.md`。
 - 进行网络捕获与请求归因时，读取 `references/network-capture.md`。
 - 需要从请求、序列化或页面内栈帧回溯源码位置时，读取 `references/source-location.md`。
@@ -104,12 +106,28 @@ Optional Fetch Example: fetch("https://xxx/Login/CheckLogin", {...})
 - 需要判断 TLS、HTTP/2、请求预热、Cookie/Header 依赖或限频是否影响复现时，读取 `references/protocol-resilience.md`。
 - 命中具体反调试类型时，再按需读取 `references/antidebug/` 下的精确规则文件；不要一次性全量加载。
 
+### 1. 静态预检（Phase 0 阶段触发）
+- 启动新任务前，必须首先读取 `references/evolution_matrix.json`。
+- **仅比对 `Target URL` 的注册主域名**（如 `login.example.com` 归并为 `example.com`；无法归并时使用 hostname）。若域名命中历史记录，强制继承上次成功的 Action 命名、Flask 路由规范及已知的环境限制。
+
+### 2. 动态特征对齐（Phase 1 & Phase 2 阶段触发）
+- 当连接浏览器并开始网络捕获或源码分析时：
+  - **在 Phase 1 锁定请求时**：比对当前请求体结构、邻近字段，是否命中历史记录中某种特定的“签名包特征”。
+  - **在 Phase 2 识别到混淆或反调试阻断时**：检查页面代码、调用栈或 Hook 日志是否包含特定关键字（如命中了 `behavioral_features` 中的 `fingerprint_keywords`）。
+  - **强制策略继承约束**：一旦特征吻合，强制继承历史成功的 Patch 方案，严禁重复历史已记录的失败尝试（`failed_attempts`）。
+  - **STE 经验继承**：命中特征后，同时读取 `behavioral_features.<feature>.ste`，按其中的战略原则、战术手册和适用场景约束当前探索路径。
+
+### 3. 策略失效回滚机制（Phase 7 / Phase 8 触发）
+- 警告：若继承了历史成功的 `successful_patch_strategy` 后，在 Phase 7（生成验证）或 Phase 8（结果校验）阶段依然遭遇失败（Validation Failed），说明目标站点已升级。
+- **强制阻断**：必须立即中断该策略的继承，清除当前域名的常规绑定，将该策略移入对应特征的 `failed_attempts` 中，并强制重新生成全新的探索分支。
+
 ## 产出要求
 - `analysis_result.json`
 - JSRPC 注入代码
 - Flask 代理代码
 - Burp autoDecoder 对接文档
 - 校验报告
+- references/evolution_matrix.json（增量更新）
 - JSRPC 手工验证链接
 - Flask 手工验证命令，例如 `curl -X POST http://127.0.0.1:5000/encode \
   -H "Content-Type: application/x-www-form-urlencoded" \
@@ -132,5 +150,6 @@ Optional Fetch Example: fetch("https://xxx/Login/CheckLogin", {...})
 - `analysis_result.json` 通过契约校验。
 - JSRPC、Flask 和 Burp 产物都由同一份分析产物生成，并通过各自校验。
 - 校验报告明确给出通过项、失败项、风险和下一步动作。
+- `references/evolution_matrix.json` 完成 Phase 9 增量更新，且写入失败不得损坏原文件。
 
 最终验收以 `references/validation-checklist.md` 为准。

@@ -10,6 +10,7 @@
 - generated Flask proxy file
 - generated Burp autoDecoder document
 - `artifacts/validation_report.json`
+- `references/evolution_matrix.json`
 
 ## `analysis_result.json`
 - 必须能被解析为 JSON。
@@ -51,6 +52,13 @@
   - `warnings`
   - `next_actions`
 - 每一项失败检查都必须标明文件，以及缺失或非法的规则。
+
+## Phase 9 经验库校验
+- `references/evolution_matrix.json` 必须能被解析为 JSON。
+- 必须保留历史 `domains` 和 `behavioral_features` 中与当前任务无关的记录。
+- 当前任务结束后必须更新当前注册主域名对应的 action、route 或失败降级记录。
+- 命中特征时必须维护 STE 结构：`strategic_principle`、`tactical_manual`、`applicable_scenarios`。
+- 并发或异常中断不得导致 JSON 空文件、截断文件或历史记忆丢失。
 
 ## 残余风险说明
 
