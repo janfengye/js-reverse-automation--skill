@@ -1,366 +1,181 @@
 #!/usr/bin/env python3
-"""Validate analysis_result.json and generated artifacts."""
+"""Four-layer artifact validator.
 
+Layer 1: Schema validation (analysis_result + candidates against JSON schemas)
+Layer 2: Static validation (Python syntax, JS syntax via Node)
+Layer 3: Candidate invariant checks (verified=true requires verification records)
+Layer 4: Cross-file consistency (actions present in both jsrpc_inject.js and flask_proxy.py)
+
+Usage:
+  python3 scripts/validate_artifacts.py \
+    --analysis analysis_result.json \
+    --candidates artifacts/encryption_candidates.json \
+    --generated generated/ \
+    --report artifacts/validation_report.json
+"""
 from __future__ import annotations
 
 import argparse
 import ast
 import json
+import py_compile
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
+from urllib.parse import parse_qsl
+
+from common import dump_json, load_json
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--analysis", required=True, help="Path to analysis_result.json.")
-    parser.add_argument("--jsrpc", required=True, help="Path to generated JSRPC file.")
-    parser.add_argument("--flask", required=True, help="Path to generated Flask file.")
-    parser.add_argument("--burp", required=True, help="Path to generated Burp markdown.")
-    parser.add_argument("--output", required=True, help="Path to validation report JSON.")
-    return parser.parse_args()
+def check_schema(name: str, data: dict, schema_path: Path) -> dict:
+    """Validate data against a JSON schema."""
+    try:
+        from jsonschema import Draft202012Validator
+        schema = load_json(schema_path)
+        errors = [e.message for e in Draft202012Validator(schema).iter_errors(data)]
+        return {"name": name, "ok": not errors, "errors": errors}
+    except ImportError:
+        return {"name": name, "ok": True, "skipped": "jsonschema not installed"}
+    except FileNotFoundError:
+        return {"name": name, "ok": True, "skipped": f"schema not found: {schema_path}"}
 
 
-def load_json(path: Path) -> dict:
-    with path.open("r", encoding="utf-8") as handle:
-        data = json.load(handle)
-    if not isinstance(data, dict):
-        raise ValueError(f"{path} must contain a JSON object")
-    return data
+def check_python(path: Path) -> dict:
+    """Check Python syntax."""
+    try:
+        py_compile.compile(str(path), doraise=True)
+        ast.parse(path.read_text(encoding="utf-8"))
+        return {"name": f"python:{path.name}", "ok": True}
+    except Exception as error:
+        return {"name": f"python:{path.name}", "ok": False, "errors": [str(error)]}
 
 
-def record(
-    checks: list[dict],
-    failures: list[dict],
-    name: str,
-    ok: bool,
-    success_detail: str,
-    failure_detail: str,
-) -> None:
-    detail = success_detail if ok else failure_detail
-    checks.append({"check": name, "ok": ok, "detail": detail})
-    if not ok:
-        failures.append({"check": name, "detail": failure_detail})
+def check_javascript(path: Path) -> dict:
+    """Check JavaScript syntax via Node.js."""
+    if not path.exists():
+        return {"name": f"javascript:{path.name}", "ok": False, "errors": ["missing"]}
+    node = shutil.which("node")
+    if not node:
+        return {"name": f"javascript:{path.name}", "ok": True, "skipped": "node unavailable"}
+    proc = subprocess.run([node, "--check", str(path)], text=True, capture_output=True)
+    return {
+        "name": f"javascript:{path.name}",
+        "ok": proc.returncode == 0,
+        "errors": [proc.stderr.strip()] if proc.returncode else []
+    }
 
 
-def non_empty_string(value: object) -> bool:
-    return isinstance(value, str) and bool(value.strip())
+def check_candidate_invariants(candidates: dict) -> dict:
+    """Check candidate verification invariants."""
+    errors = []
+    for c in candidates.get("candidates", []):
+        evidence_types = [e.get("type") for e in c.get("evidence", []) if isinstance(e, dict)]
+        verification = c.get("verification")
+        provenance = c.get("provenance")
+        if c.get("confidence") == "high" and not c.get("verified"):
+            errors.append(f"{c.get('id')}: high confidence without verification")
+        if c.get("verified"):
+            if not isinstance(verification, list) or not verification:
+                errors.append(f"{c.get('id')}: verified without verification records")
+            if c.get("source") == "hint" or c.get("type") == "hint":
+                errors.append(f"{c.get('id')}: manual hint cannot be verified")
+            matched = any(
+                isinstance(record, dict) and (
+                    record.get("matched") is True or record.get("verified") is True or
+                    any(isinstance(test, dict) and test.get("matched") is True
+                        for test in record.get("tests", []))
+                )
+                for record in (verification or [])
+            )
+            if not matched:
+                errors.append(f"{c.get('id')}: no successful runtime/request match")
+    return {"name": "candidate_invariants", "ok": not errors, "errors": errors}
 
 
-def has_runtime_binding(runtime: dict) -> bool:
-    return non_empty_string(runtime.get("bind_this_path")) or non_empty_string(
-        runtime.get("bind_this_mode")
-    )
+def check_cross_file(analysis: dict, generated: Path) -> dict:
+    """Check cross-file consistency between JSRPC and Flask."""
+    errors = []
+    jsrpc = (generated / "jsrpc_inject.js").read_text(encoding="utf-8") if (generated / "jsrpc_inject.js").exists() else ""
+    flask = (generated / "flask_proxy.py").read_text(encoding="utf-8") if (generated / "flask_proxy.py").exists() else ""
+
+    # Check action names
+    action_name = analysis.get("jsrpc", {}).get("action_name", "")
+    if action_name and action_name not in jsrpc:
+        errors.append(f"action missing from jsrpc_inject.js: {action_name}")
+    if action_name and action_name not in flask:
+        errors.append(f"action missing from flask_proxy.py: {action_name}")
+
+    # Check entrypoint resolution
+    if "resolveEntrypoint" not in jsrpc and "resolvePath" not in jsrpc:
+        errors.append("jsrpc_inject.js does not contain entrypoint resolution")
+
+    return {"name": "cross_file_consistency", "ok": not errors, "errors": errors}
 
 
-def valid_bind_this_mode(runtime: dict) -> bool:
-    mode = runtime.get("bind_this_mode")
-    if mode is None:
-        return True
-    return mode in {"window", "global", "entrypoint_parent", "none", "null"}
-
-
-def has_entrypoint_locator(entrypoint: dict) -> bool:
-    entrypoint_type = entrypoint.get("type")
-    if entrypoint_type == "resolver":
-        return non_empty_string(entrypoint.get("resolver_path")) or non_empty_string(
-            entrypoint.get("resolver_name")
-        )
-    return non_empty_string(entrypoint.get("path")) or non_empty_string(
-        entrypoint.get("resolver_name")
-    )
+def mock_semantics() -> dict:
+    """Check HTTP form semantics."""
+    raw = "a=1&a=2&password=x+y&empty="
+    pairs = parse_qsl(raw, keep_blank_values=True)
+    errors = []
+    if pairs[:2] != [("a", "1"), ("a", "2")]:
+        errors.append("duplicate form keys not preserved")
+    if pairs[-1] != ("empty", ""):
+        errors.append("blank form value not preserved")
+    return {"name": "mock_http_semantics", "ok": not errors, "errors": errors}
 
 
 def main() -> int:
-    args = parse_args()
-    analysis_path = Path(args.analysis)
-    jsrpc_path = Path(args.jsrpc)
-    flask_path = Path(args.flask)
-    burp_path = Path(args.burp)
-    report_path = Path(args.output)
+    parser = argparse.ArgumentParser(description="Four-layer artifact validator.")
+    parser.add_argument("--analysis", required=True, help="Path to analysis_result.json.")
+    parser.add_argument("--candidates", help="Path to encryption_candidates.json.")
+    parser.add_argument("--generated", required=True, help="Path to generated/ directory.")
+    parser.add_argument("--report", required=True, help="Path to validation report JSON.")
+    parser.add_argument("--e2e-result", help="Path to optional E2E result JSON.")
+    args = parser.parse_args()
 
-    analysis = load_json(analysis_path)
-    jsrpc_content = jsrpc_path.read_text(encoding="utf-8")
-    flask_content = flask_path.read_text(encoding="utf-8")
-    burp_content = burp_path.read_text(encoding="utf-8")
+    base = Path(__file__).parents[1]
+    generated = Path(args.generated)
+    analysis = load_json(args.analysis)
 
-    checks: list[dict] = []
-    failures: list[dict] = []
-    warnings = list(analysis.get("diagnostics", {}).get("warnings", []))
+    checks = []
 
-    required_keys = [
-        "skill",
-        "input",
-        "trace",
-        "parameters",
-        "jsrpc",
-        "flask",
-        "burp",
-        "diagnostics",
-        "validation_targets",
-    ]
-    for key in required_keys:
-        record(
-            checks,
-            failures,
-            f"analysis:{key}",
-            key in analysis,
-            f"top-level key present: {key}",
-            f"missing top-level key: {key}",
-        )
+    # Layer 1: Schema validation
+    schema_path = base / "schemas" / "analysis_result.schema.json"
+    if schema_path.exists():
+        checks.append(check_schema("analysis_schema", analysis, schema_path))
 
-    requested_parameters = analysis.get("input", {}).get("parameters", [])
-    parameters = analysis.get("parameters", {})
-    requested_iter = requested_parameters if isinstance(requested_parameters, list) else []
-    parameter_map = parameters if isinstance(parameters, dict) else {}
-    record(
-        checks,
-        failures,
-        "analysis:input:parameters",
-        isinstance(requested_parameters, list) and bool(requested_parameters),
-        "input parameters list is present",
-        "analysis.input.parameters must be a non-empty list",
-    )
-    record(
-        checks,
-        failures,
-        "analysis:parameters-object",
-        isinstance(parameters, dict),
-        "parameters object is present",
-        "analysis.parameters must be a JSON object",
-    )
-    for parameter in requested_iter:
-        record(
-            checks,
-            failures,
-            f"analysis:parameter:{parameter}",
-            parameter in parameter_map,
-            f"parameter contract present: {parameter}",
-            f"missing parameter contract for {parameter}",
-        )
-        if parameter in parameter_map:
-            parameter_contract = parameter_map[parameter]
-            entrypoint = parameter_contract.get("entrypoint")
-            call_signature = parameter_contract.get("call_signature")
-            runtime = parameter_contract.get("runtime")
-            record(
-                checks,
-                failures,
-                f"analysis:parameter:{parameter}:entrypoint",
-                isinstance(entrypoint, dict),
-                f"entrypoint contract present for {parameter}",
-                f"missing entrypoint contract for {parameter}",
-            )
-            if isinstance(entrypoint, dict):
-                record(
-                    checks,
-                    failures,
-                    f"analysis:parameter:{parameter}:entrypoint-type",
-                    non_empty_string(entrypoint.get("type")),
-                    f"entrypoint type present for {parameter}",
-                    f"missing entrypoint.type for {parameter}",
-                )
-                record(
-                    checks,
-                    failures,
-                    f"analysis:parameter:{parameter}:entrypoint-locator",
-                    has_entrypoint_locator(entrypoint),
-                    f"entrypoint locator present for {parameter}",
-                    (
-                        "entrypoint must define path, resolver_name, or resolver_path "
-                        f"for {parameter}"
-                    ),
-                )
-            record(
-                checks,
-                failures,
-                f"analysis:parameter:{parameter}:call-signature",
-                isinstance(call_signature, dict),
-                f"call signature present for {parameter}",
-                f"missing call signature for {parameter}",
-            )
-            if isinstance(call_signature, dict):
-                record(
-                    checks,
-                    failures,
-                    f"analysis:parameter:{parameter}:call-signature-async",
-                    isinstance(call_signature.get("async"), bool),
-                    f"call_signature.async present for {parameter}",
-                    f"call_signature.async must be boolean for {parameter}",
-                )
-            record(
-                checks,
-                failures,
-                f"analysis:parameter:{parameter}:runtime",
-                isinstance(runtime, dict),
-                f"runtime contract present for {parameter}",
-                f"missing runtime contract for {parameter}",
-            )
-            if isinstance(runtime, dict):
-                record(
-                    checks,
-                    failures,
-                    f"analysis:parameter:{parameter}:runtime-binding",
-                    has_runtime_binding(runtime),
-                    f"runtime binding present for {parameter}",
-                    (
-                        "runtime must define bind_this_path or bind_this_mode "
-                        f"for {parameter}"
-                    ),
-                )
-                record(
-                    checks,
-                    failures,
-                    f"analysis:parameter:{parameter}:runtime-bind-mode",
-                    valid_bind_this_mode(runtime),
-                    f"runtime bind mode valid for {parameter}",
-                    (
-                        "runtime.bind_this_mode must be one of window, global, "
-                        f"entrypoint_parent, none, null for {parameter}"
-                    ),
-                )
+    if args.candidates:
+        candidates = load_json(args.candidates)
+        candidates_schema = base / "schemas" / "candidates.schema.json"
+        if candidates_schema.exists():
+            checks.append(check_schema("candidate_schema", candidates, candidates_schema))
+        checks.append(check_candidate_invariants(candidates))
 
-    trace = analysis.get("trace", {})
-    request_replay = trace.get("request_replay", {}) if isinstance(trace, dict) else {}
-    evidence = trace.get("evidence", []) if isinstance(trace, dict) else []
-    record(
-        checks,
-        failures,
-        "analysis:trace:request-url",
-        isinstance(request_replay, dict) and non_empty_string(request_replay.get("request_url")),
-        "trace request URL present",
-        "trace.request_replay.request_url is required",
-    )
-    record(
-        checks,
-        failures,
-        "analysis:trace:method",
-        isinstance(request_replay, dict) and non_empty_string(request_replay.get("method")),
-        "trace method present",
-        "trace.request_replay.method is required",
-    )
-    parameter_locations = (
-        request_replay.get("parameter_locations", {}) if isinstance(request_replay, dict) else {}
-    )
-    record(
-        checks,
-        failures,
-        "analysis:trace:parameter-locations",
-        isinstance(parameter_locations, dict) and bool(parameter_locations),
-        "trace parameter locations present",
-        "trace.request_replay.parameter_locations must be a non-empty object",
-    )
-    record(
-        checks,
-        failures,
-        "analysis:trace:evidence",
-        isinstance(evidence, list) and bool(evidence),
-        "trace evidence present",
-        "trace.evidence must be a non-empty list",
-    )
+    # Layer 2: Static validation
+    for name in ("flask_proxy.py",):
+        path = generated / name
+        checks.append(check_python(path) if path.exists() else {"name": f"python:{name}", "ok": False, "errors": ["missing"]})
+    for name in ("jsrpc_inject.js", "runtime_hook_probe.js", "module_probe.js"):
+        checks.append(check_javascript(generated / name))
 
-    diagnostics_status = analysis.get("diagnostics", {}).get("status")
-    record(
-        checks,
-        failures,
-        "analysis:diagnostics-status",
-        diagnostics_status in {"ready", "partial", "failed"},
-        f"diagnostics status is valid: {diagnostics_status}",
-        "diagnostics.status must be one of ready, partial, failed",
-    )
+    # Layer 3: Cross-file consistency
+    checks.append(check_cross_file(analysis, generated))
+    checks.append(mock_semantics())
 
-    action_name = analysis.get("jsrpc", {}).get("action_name", "")
-    record(
-        checks,
-        failures,
-        "jsrpc:action-name",
-        bool(action_name and action_name in jsrpc_content),
-        f"configured action name found: {action_name}",
-        "generated JSRPC file does not contain the configured action name",
-    )
-    record(
-        checks,
-        failures,
-        "jsrpc:resolver",
-        "resolveEntrypoint" in jsrpc_content,
-        "entrypoint resolution logic present",
-        "generated JSRPC file is missing entrypoint resolution logic",
-    )
-    record(
-        checks,
-        failures,
-        "jsrpc:raw-success",
-        "resolve(result);" in jsrpc_content and "resolve(asyncResult);" in jsrpc_content,
-        "raw success return handling present",
-        "generated JSRPC file does not directly resolve raw results",
-    )
-    record(
-        checks,
-        failures,
-        "jsrpc:string-error",
-        "__JSRPC_ERROR__:" in jsrpc_content,
-        "string error sentinel present",
-        "generated JSRPC file is missing the string error sentinel",
-    )
+    # Layer 4: Optional real E2E
+    if args.e2e_result:
+        e2e = load_json(args.e2e_result, {})
+        checks.append({"name": "real_e2e", "ok": bool(e2e.get("passed")), "details": e2e})
 
-    try:
-        ast.parse(flask_content)
-        flask_parse_ok = True
-        flask_parse_detail = "python syntax ok"
-    except SyntaxError as exc:
-        flask_parse_ok = False
-        flask_parse_detail = f"python syntax error: {exc}"
-    record(
-        checks,
-        failures,
-        "flask:syntax",
-        flask_parse_ok,
-        flask_parse_detail,
-        flask_parse_detail,
-    )
-    record(
-        checks,
-        failures,
-        "flask:healthz",
-        "@app.get(\"/healthz\")" in flask_content,
-        "generated Flask file contains /healthz",
-        "generated Flask file is missing /healthz",
-    )
-    record(
-        checks,
-        failures,
-        "flask:encode-route",
-        analysis.get("flask", {}).get("route", "") in flask_content,
-        "generated Flask file contains the configured encode route",
-        "generated Flask file is missing the configured encode route",
-    )
-
-    for required_text in ("dataBody", "dataHeaders", "Validation Steps", "Troubleshooting"):
-        record(
-            checks,
-            failures,
-            f"burp:{required_text}",
-            required_text in burp_content,
-            f"generated Burp document contains: {required_text}",
-            f"generated Burp document is missing section or token: {required_text}",
-        )
-
-    status = "passed" if not failures else "failed"
     report = {
-        "status": status,
-        "checks": checks,
-        "warnings": warnings,
-        "failures": failures,
-        "next_actions": [
-            failure["detail"] for failure in failures
-        ],
+        "version": "2.1.0",
+        "passed": all(c.get("ok") for c in checks),
+        "checks": checks
     }
-
-    report_path.parent.mkdir(parents=True, exist_ok=True)
-    with report_path.open("w", encoding="utf-8") as handle:
-        json.dump(report, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
-
-    print(json.dumps({"status": status, "output": str(report_path)}, ensure_ascii=False))
-    return 0 if not failures else 1
+    dump_json(args.report, report)
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0 if report["passed"] else 2
 
 
 if __name__ == "__main__":

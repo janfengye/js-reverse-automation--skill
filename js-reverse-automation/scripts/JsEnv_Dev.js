@@ -93,6 +93,12 @@ Hlclient.prototype.handlerRequest = function (requestJson) {
         try {
             param = JSON.parse(param)
         } catch (e) {
+            // Fix: JSRPC may send param without outer braces
+            try {
+                param = JSON.parse('{' + param + '}')
+            } catch (e2) {
+                param = { value: param }
+            }
         }
         theHandler(function (response) {
             _this.sendResult(action, message_id, response);
