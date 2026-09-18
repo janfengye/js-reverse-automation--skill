@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate JSRPC injection code from analysis_result.json.
 
-Supports both v2.0 parameter-based config and v2.1 transforms-based config.
+Supports parameter-based and transforms-based configuration.
 Includes evidence gating: unverified candidates return __JSRPC_ERROR__:EvidenceMissing.
 
 Usage:
@@ -29,7 +29,7 @@ def parameter_name(transform: dict) -> str:
 
 
 def normalize_analysis(analysis: dict) -> dict:
-    """Normalize analysis to a common format, supporting both v2.0 and v2.1 styles."""
+    """Normalize analysis to a common format."""
     transforms = list(analysis.get("transforms") or [])
     raw_parameters = analysis.get("parameters") or {}
     parameters: dict[str, dict] = {str(k): dict(v) for k, v in raw_parameters.items() if isinstance(v, dict)}
@@ -47,6 +47,9 @@ def normalize_analysis(analysis: dict) -> dict:
             "arguments": ["value"], "returns": "unknown", "async": False
         })
         config["jsra_transform"] = transform
+        for key in ("capture", "dom_bindings", "delivery_mode"):
+            if key in transform:
+                config.setdefault(key, transform[key])
 
     # Ensure all parameters have required fields
     for name, config in parameters.items():
@@ -97,11 +100,13 @@ def candidate_verified(candidate: dict | None) -> tuple[bool, str]:
 
 def find_candidate_file(analysis_path: Path) -> Path | None:
     """Find candidate files in the artifacts directory."""
-    artifacts = analysis_path.parent
-    for name in ("encryption_candidates.json", "encryption_candidates.verified.json"):
-        path = artifacts / name
-        if path.exists():
-            return path
+    roots = (analysis_path.parent / "artifacts", analysis_path.parent)
+    for root in roots:
+        # Prefer the post-verification artifact whenever both files exist.
+        for name in ("encryption_candidates.verified.json", "encryption_candidates.json"):
+            path = root / name
+            if path.exists():
+                return path
     return None
 
 
@@ -183,6 +188,17 @@ def build_script(config: dict, gate_errors: dict[str, str]) -> str:
     return value;
   }}
 
+  function bindInputFields(payload, parameterConfig, raw) {{
+    const bindings = parameterConfig.dom_bindings || {{}};
+    const fields = payload.fields || (payload.context && payload.context.fields) || payload;
+    for (const [source, elementId] of Object.entries(bindings)) {{
+      const element = document.getElementById(elementId);
+      if (!element) continue;
+      const value = source === "value" ? raw : fields[source];
+      if (value !== undefined) element.value = String(value);
+    }}
+  }}
+
   function resultOrError(parameter, input, result) {{
     if (result === undefined || result === null)
       return errorValue(parameter, "InvalidResult", "page function returned no value");
@@ -191,6 +207,215 @@ def build_script(config: dict, gate_errors: dict[str, str]) -> str:
     if (typeof result === "string" && result.indexOf("__JSRPC_ERROR__:") === 0) return result;
     if (result instanceof ArrayBuffer) return Array.from(new Uint8Array(result));
     return result;
+  }}
+
+  function serializeRequestBody(body) {{
+    if (body == null) return null;
+    if (typeof body === "string") return body;
+    if (body instanceof URLSearchParams) return body.toString();
+    if (body instanceof FormData) {{
+      const values = {{}};
+      for (const [key, value] of body.entries())
+        values[key] = typeof value === "string" ? value : `[${{value.constructor.name}}]`;
+      return values;
+    }}
+    if (body instanceof ArrayBuffer) return `[ArrayBuffer:${{body.byteLength}}]`;
+    if (ArrayBuffer.isView(body)) return `[${{body.constructor.name}}:${{body.byteLength}}]`;
+    try {{ return JSON.stringify(body); }} catch (_) {{ return String(body); }}
+  }}
+
+  function headerObject(headers) {{
+    if (!headers) return {{}};
+    try {{ return Object.fromEntries(new Headers(headers).entries()); }}
+    catch (_) {{ return {{}}; }}
+  }}
+
+  function matchesRoute(url, expected) {{
+    if (!expected) return true;
+    try {{
+      const actualPath = new URL(url, window.location.href).pathname.replace(/\\/+$/, "");
+      const expectedPath = new URL(expected, window.location.href).pathname.replace(/\\/+$/, "");
+      return actualPath === expectedPath;
+    }} catch (_) {{
+      return String(url).split("?", 1)[0] === String(expected).split("?", 1)[0];
+    }}
+  }}
+
+  async function invokeWithNetworkCapture(fn, thisArg, args, captureConfig = {{}}) {{
+    const originalFetch = window.fetch;
+    const originalAlert = window.alert;
+    const xhrPrototype = window.XMLHttpRequest && window.XMLHttpRequest.prototype;
+    const originalXhrOpen = xhrPrototype && xhrPrototype.open;
+    const originalXhrSend = xhrPrototype && xhrPrototype.send;
+    const originalXhrSetRequestHeader = xhrPrototype && xhrPrototype.setRequestHeader;
+    const timeoutMs = 10000;
+    let captured = null;
+    const requests = [];
+    let resolveNetwork;
+    const networkSeen = new Promise(resolve => {{ resolveNetwork = resolve; }});
+    let restored = false;
+    const suppressPageUi = captureConfig.suppress_page_success === true;
+    const recordNetwork = record => {{
+      requests.push(record);
+      const expected = String(captureConfig.url_contains || captureConfig.route || "");
+      if (matchesRoute(record.url, expected)) {{
+        captured = record;
+        resolveNetwork(captured);
+        return true;
+      }}
+      return false;
+    }};
+    const parseXhrResponse = xhr => {{
+      try {{
+        const value = xhr.responseType === "" || xhr.responseType === "text"
+          ? xhr.responseText : xhr.response;
+        if (typeof value === "string") {{
+          try {{ return JSON.parse(value); }} catch (_) {{ return value; }}
+        }}
+        return serializeRequestBody(value);
+      }} catch (_) {{ return null; }}
+    }};
+    const withTimeout = (promise, ms, fallback) => {{
+      let timer;
+      const timeout = new Promise(resolve => {{
+        timer = setTimeout(() => resolve(fallback), ms);
+      }});
+      return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+    }};
+    const restore = () => {{
+      if (restored) return;
+      restored = true;
+      if (suppressPageUi) {{
+        try {{ window.alert = originalAlert; }} catch (_) {{}}
+      }}
+      try {{
+        Object.defineProperty(window, "fetch", {{
+          configurable: true, writable: true, value: originalFetch
+        }});
+      }} catch (_) {{ try {{ window.fetch = originalFetch; }} catch (__) {{}} }}
+      if (xhrPrototype) {{
+        for (const [key, value] of [["open", originalXhrOpen], ["send", originalXhrSend], ["setRequestHeader", originalXhrSetRequestHeader]]) {{
+          if (typeof value !== "function") continue;
+          try {{ Object.defineProperty(xhrPrototype, key, {{ configurable: true, writable: true, value }}); }}
+          catch (_) {{ try {{ xhrPrototype[key] = value; }} catch (__) {{}} }}
+        }}
+      }}
+    }};
+
+    // Challenge pages commonly use alert() before redirecting on either
+    // success or failure.  A synthetic response used only to keep the page
+    // in place must not leave an external JSRPC caller blocked by a modal.
+    // Keep the suppression scoped to this invocation and restore the native
+    // function in every exit path.
+    if (suppressPageUi && typeof originalAlert === "function") {{
+      try {{ window.alert = () => {{}}; }} catch (_) {{}}
+    }}
+
+    if (typeof originalFetch === "function") {{
+      const captureFetch = async function (input, init = {{}}) {{
+        const url = typeof input === "string" ? input : (input && input.url) || "";
+        const method = (init && init.method) || (input && input.method) || "GET";
+        const body = init && Object.prototype.hasOwnProperty.call(init, "body")
+          ? init.body : (input && input.body);
+        const response = await Reflect.apply(originalFetch, this, arguments);
+        let responseBody = null;
+        try {{ responseBody = await response.clone().json(); }} catch (_) {{
+          try {{ responseBody = await response.clone().text(); }} catch (__) {{}}
+        }}
+        const record = {{
+          url,
+          method,
+          headers: headerObject(init && init.headers),
+          requestBody: serializeRequestBody(body),
+          status: response.status,
+          response: responseBody
+        }};
+        if (recordNetwork(record)) {{
+          if (suppressPageUi) {{
+            try {{
+              return new Response(JSON.stringify({{ success: false }}), {{
+                status: response.status,
+                headers: {{ "Content-Type": "application/json" }}
+              }});
+            }} catch (_) {{}}
+          }}
+        }}
+        return response;
+      }};
+      try {{
+        Object.defineProperty(window, "fetch", {{
+          configurable: true, writable: true, value: captureFetch
+        }});
+      }} catch (_) {{
+        try {{ window.fetch = captureFetch; }} catch (__) {{}}
+      }}
+    }}
+
+    if (xhrPrototype && typeof originalXhrOpen === "function" && typeof originalXhrSend === "function") {{
+      try {{
+        Object.defineProperty(xhrPrototype, "open", {{
+          configurable: true, writable: true,
+          value: function(method, url) {{
+            this.__jsraCapture = {{ method: String(method || "GET"), url: String(url || ""), headers: {{}} }};
+            return Reflect.apply(originalXhrOpen, this, arguments);
+          }}
+        }});
+        if (typeof originalXhrSetRequestHeader === "function") {{
+          Object.defineProperty(xhrPrototype, "setRequestHeader", {{
+            configurable: true, writable: true,
+            value: function(name, value) {{
+              const capture = this.__jsraCapture || (this.__jsraCapture = {{ method: "GET", url: "", headers: {{}} }});
+              capture.headers[String(name)] = String(value);
+              return Reflect.apply(originalXhrSetRequestHeader, this, arguments);
+            }}
+          }});
+        }}
+        Object.defineProperty(xhrPrototype, "send", {{
+          configurable: true, writable: true,
+          value: function(body) {{
+            const xhr = this;
+            const capture = xhr.__jsraCapture || {{ method: "GET", url: "", headers: {{}} }};
+            const onLoadEnd = () => {{
+              const record = {{
+                transport: "xhr",
+                url: capture.url,
+                method: capture.method,
+                headers: capture.headers,
+                requestBody: serializeRequestBody(body),
+                status: xhr.status,
+                response: parseXhrResponse(xhr)
+              }};
+              recordNetwork(record);
+              try {{ xhr.removeEventListener("loadend", onLoadEnd); }} catch (_) {{}}
+            }};
+            try {{ xhr.addEventListener("loadend", onLoadEnd, {{ once: true }}); }} catch (_) {{}}
+            return Reflect.apply(originalXhrSend, this, arguments);
+          }}
+        }});
+      }} catch (_) {{
+        // Some pages make XHR methods non-configurable; fetch capture remains available.
+      }}
+    }}
+
+    let resultState;
+    try {{
+      const result = fn.apply(thisArg, args);
+      resultState = await withTimeout(
+        Promise.resolve(result).then(value => ({{ value }}), error => ({{ error }})),
+        timeoutMs, {{ timedOut: true }}
+      );
+    }} catch (error) {{
+      resultState = {{ error }};
+    }}
+    const network = await withTimeout(networkSeen, timeoutMs, null);
+    // The page function may return void while its fetch().then(...) chain is
+    // still pending.  Keep alert() muted through that microtask/macrotask
+    // boundary so the synthetic response cannot open a modal after capture.
+    if (suppressPageUi && network) {{
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }}
+    restore();
+    return {{ resultState, network: network || captured, requests }};
   }}
 
   if (typeof Hlclient === "undefined")
@@ -216,15 +441,33 @@ def build_script(config: dict, gate_errors: dict[str, str]) -> str:
       if (typeof fn !== "function")
         throw new Error("verified page entrypoint is not callable");
       const raw = payload.value;
+      bindInputFields(payload, parameterConfig, raw);
       let args = Array.isArray(payload.args) ? payload.args.map(coerce) : [coerce(raw)];
       const transform = parameterConfig.jsra_transform || {{}};
       if (Array.isArray(transform.arguments)) {{
         args = transform.arguments.map((arg) =>
           arg && arg.source === "constant" ? arg.value : coerce(raw));
       }}
-      const result = fn.apply(resolveThis(parameterConfig), args);
-      Promise.resolve(result)
-        .then((value) => resolve(resultOrError(parameter, raw, value)))
+      const captureConfig = parameterConfig.capture || transform.capture || {{}};
+      invokeWithNetworkCapture(fn, resolveThis(parameterConfig), args, captureConfig)
+        .then((invocation) => {{
+          const resultState = invocation.resultState || {{}};
+          if (resultState.error) throw resultState.error;
+          if (invocation.network) {{
+            resolve({{
+              success: true,
+              parameter,
+              plaintext: raw,
+              result: resultState.value === undefined ? null : resultState.value,
+              request: invocation.network,
+              requestBody: invocation.network.requestBody,
+              response: invocation.network.response,
+              status: invocation.network.status
+            }});
+            return;
+          }}
+          resolve(resultOrError(parameter, raw, resultState.value));
+        }})
         .catch((error) => resolve(errorValue(parameter, error.name || "Error", error.message || String(error))));
     }} catch (error) {{
       resolve(errorValue(parameter, error.name || "Error", error.message || String(error)));

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Generate a Flask proxy from analysis_result.json.
+"""根据 analysis_result.json 生成 Flask 代理。
 
-Supports both v2.0 (dataBody/dataHeaders) and v2.1 (transforms-driven) modes.
-All transforms go through JSRPC — no crypto implementation in this file.
+支持 dataBody/dataHeaders 兼容模式和 transforms 驱动模式。
+所有转换都通过 JSRPC 完成，本文件不实现密码算法。
 
 Usage:
   python3 scripts/emit_flask_proxy.py --analysis analysis_result.json --output generated/flask_proxy.py
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -38,8 +39,10 @@ def python_literal(value: Any) -> str:
 def normalize(analysis: dict) -> dict:
     """Normalize analysis to a common config format."""
     transforms = list(analysis.get("transforms") or [])
+    jsrpc_input = dict(analysis.get("jsrpc") or {})
+    default_action = jsrpc_input.get("action_name") or jsrpc_input.get("action") or "jsra_transform"
     if not transforms:
-        # v2.0 mode: build transforms from parameters
+        # 兼容模式：根据 parameters 构造 transforms
         for name, config in (analysis.get("parameters") or {}).items():
             entrypoint = config.get("entrypoint", {}) if isinstance(config, dict) else {}
             transforms.append({
@@ -48,12 +51,15 @@ def normalize(analysis: dict) -> dict:
                 "location": "body",
                 "content_type": "auto",
                 "path": f"$.{name}",
-                "action": name,
+                "action": default_action,
                 "candidate_path": entrypoint.get("path", ""),
                 "safe_to_invoke": False,
+                "delivery_mode": config.get("delivery_mode", "result") if isinstance(config, dict) else "result",
+                "capture": config.get("capture", {}) if isinstance(config, dict) else {},
+                "dom_bindings": config.get("dom_bindings", {}) if isinstance(config, dict) else {},
             })
 
-    jsrpc = dict(analysis.get("jsrpc") or {})
+    jsrpc = jsrpc_input
     transport = jsrpc.get("transport") if isinstance(jsrpc.get("transport"), dict) else {}
     jsrpc_config = {
         "base_url": jsrpc.get("base_url") or transport.get("go_url") or "http://127.0.0.1:12080",
@@ -69,7 +75,6 @@ def normalize(analysis: dict) -> dict:
     flask = dict(analysis.get("flask") or {})
     flask_server = dict(analysis.get("flask_server") or {})
     return {
-        "version": str(analysis.get("version", "2.1.0")),
         "jsrpc": jsrpc_config,
         "transforms": transforms,
         "flask_port": int(flask_server.get("port", flask.get("port", flask.get("listen_port", 5000)))),
@@ -85,13 +90,15 @@ def build_script(analysis: dict) -> str:
 from __future__ import annotations
 
 import json
+import os
 from collections import OrderedDict
-from urllib.parse import parse_qsl, urlencode
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import requests
 from flask import Flask, Response, jsonify, request
 
 CONFIG = {python_literal(config)}
+CONFIG["flask_port"] = int(os.environ.get("JSRA_FLASK_PORT", CONFIG["flask_port"]))
 app = Flask(__name__)
 
 
@@ -109,11 +116,28 @@ def _error_detail(payload: object) -> str:
         return str(payload)
 
 
-def _extract_result(payload: object) -> object:
+def _nested_jsrpc_data(payload: object) -> object:
+    if not isinstance(payload, dict):
+        return payload
+    nested = payload.get("data")
+    if isinstance(nested, str):
+        try:
+            return json.loads(nested)
+        except ValueError:
+            return nested
+    return nested if nested is not None else payload
+
+
+def _extract_result(payload: object, transform: dict | None = None) -> object:
     if not isinstance(payload, dict):
         raise JSRPCError("JSRPC response must be a JSON object", "unexpected_response", _error_detail(payload))
     if payload.get("ok") is False or payload.get("status") in {{"error", "failed", "failure"}}:
         raise JSRPCError("JSRPC reported an error", "entrypoint_error", _error_detail(payload))
+    nested = _nested_jsrpc_data(payload)
+    if isinstance(transform, dict) and transform.get("delivery_mode") == "request_body":
+        if isinstance(nested, dict) and nested.get("requestBody") not in (None, ""):
+            return nested["requestBody"]
+        raise JSRPCError("JSRPC response has no captured requestBody", "unexpected_response", _error_detail(payload))
     for key in ("response_data", "data", "result", "value"):
         if key in payload:
             value = payload[key]
@@ -141,20 +165,23 @@ def _validate_result(value: object, input_value: object, transform: dict) -> obj
 def jsrpc_call(action: str, value: object, transform: dict) -> object:
     cfg = CONFIG["jsrpc"]
     base = str(cfg["base_url"]).rstrip("/")
+    endpoint = base if base.endswith("/go") else base + "/go"
     timeout = float(cfg.get("timeout_seconds", 10))
     context = {{"transform_id": transform.get("id"), "candidate_path": transform.get("candidate_path")}}
+    if transform.get("context_fields") is not None:
+        context["fields"] = transform.get("context_fields")
     param = json.dumps({{"parameter": transform.get("id"), "value": value, "context": context}}, ensure_ascii=False)
     try:
         if cfg.get("transport") == "post_json":
-            response = requests.post(base + "/go", json={{"group": cfg["group"], "action": action, "param": param}}, timeout=timeout)
+            response = requests.post(endpoint, json={{"group": cfg["group"], "action": action, "param": param}}, timeout=timeout)
         else:
-            response = requests.get(base + "/go", params={{"group": cfg["group"], "action": action, "param": param}}, timeout=timeout)
+            response = requests.get(endpoint, params={{"group": cfg["group"], "action": action, "param": param}}, timeout=timeout)
         response.raise_for_status()
         try:
             payload = response.json()
         except ValueError as error:
             raise JSRPCError("JSRPC returned non-JSON data", "unexpected_response", str(error)) from error
-        return _validate_result(_extract_result(payload), value, transform)
+        return _validate_result(_extract_result(payload, transform), value, transform)
     except JSRPCError:
         raise
     except requests.Timeout as error:
@@ -196,12 +223,91 @@ def json_set(data: object, path: str, value: object) -> object:
     return data
 
 
+def body_value(data: object, raw: str, transform: dict) -> object:
+    """Find the plaintext for request-body transforms without hard-coding a field name."""
+    path = transform.get("path")
+    try:
+        return json_get(data, path)
+    except (KeyError, IndexError, TypeError, ValueError):
+        if isinstance(data, dict):
+            for key in ("password", "value", "data"):
+                if key in data:
+                    return data[key]
+    return raw
+
+
+def transforms_for(direction: str, location: str) -> list[dict]:
+    return [t for t in CONFIG["transforms"] if t.get("direction") == direction and t.get("location") == location]
+
+
 def body_transforms(direction: str) -> list[dict]:
-    return [t for t in CONFIG["transforms"] if t.get("direction") == direction and t.get("location") in ("body", "response")]
+    return transforms_for(direction, "body") + transforms_for(direction, "response")
+
+
+def transform_key(transform: dict) -> str:
+    path = str(transform.get("path") or "")
+    return path.removeprefix("$.headers.").removeprefix("$.cookies.").removeprefix("$.cookie.").removeprefix("$.").split(".")[-1]
+
+
+def transform_query_target(target: str, transforms: list[dict]) -> str:
+    if not transforms or "?" not in target:
+        return target
+    parts = urlsplit(target)
+    pairs = parse_qsl(parts.query, keep_blank_values=True, strict_parsing=False)
+    keys = {{transform_key(t): t for t in transforms}}
+    updated = []
+    for name, value in pairs:
+        transform = keys.get(name)
+        if transform:
+            value = str(jsrpc_call(transform.get("action", CONFIG["jsrpc"]["action"]), value, transform))
+        updated.append((name, value))
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(updated, doseq=True), parts.fragment))
+
+
+def transform_cookie_value(value: str, transforms: list[dict]) -> str:
+    keys = {{transform_key(t): t for t in transforms}}
+    pairs = []
+    for item in value.split(";"):
+        name, separator, current = item.strip().partition("=")
+        if not separator:
+            pairs.append(item.strip())
+            continue
+        transform = keys.get(name)
+        if transform:
+            current = str(jsrpc_call(transform.get("action", CONFIG["jsrpc"]["action"]), current, transform))
+        pairs.append(f"{{name}}={{current}}")
+    return "; ".join(pairs)
+
+
+def transform_headers(header_block: str, direction: str) -> str:
+    header_transforms = transforms_for(direction, "header")
+    cookie_transforms = transforms_for(direction, "cookie")
+    if not header_transforms and not cookie_transforms:
+        return header_block
+    by_name = {{transform_key(t).lower(): t for t in header_transforms}}
+    lines = []
+    for line in header_block.splitlines():
+        if ":" not in line:
+            lines.append(line)
+            continue
+        name, value = line.split(":", 1)
+        transform = by_name.get(name.strip().lower())
+        if transform:
+            value = " " + str(jsrpc_call(transform.get("action", CONFIG["jsrpc"]["action"]), value.strip(), transform))
+        if name.strip().lower() == "cookie" and cookie_transforms:
+            value = " " + transform_cookie_value(value.strip(), cookie_transforms)
+        lines.append(name + ":" + value)
+    return "\\r\\n".join(lines)
 
 
 def transform_json(raw: str, transforms: list[dict]) -> str:
     data = json.loads(raw or "null", object_pairs_hook=OrderedDict)
+    body_transform = next((t for t in transforms if t.get("delivery_mode") == "request_body"), None)
+    if body_transform:
+        old = body_value(data, raw, body_transform)
+        call_transform = dict(body_transform)
+        call_transform["context_fields"] = data
+        return str(jsrpc_call(call_transform.get("action", CONFIG["jsrpc"]["action"]), old, call_transform))
     for transform in transforms:
         old = json_get(data, transform.get("path"))
         data = json_set(data, transform.get("path"), jsrpc_call(transform.get("action", CONFIG["jsrpc"]["action"]), old, transform))
@@ -210,6 +316,14 @@ def transform_json(raw: str, transforms: list[dict]) -> str:
 
 def transform_form(raw: str, transforms: list[dict]) -> str:
     pairs = parse_qsl(raw, keep_blank_values=True, strict_parsing=False)
+    body_transform = next((t for t in transforms if t.get("delivery_mode") == "request_body"), None)
+    if body_transform:
+        fields = dict(pairs)
+        key = str(body_transform.get("path", "")).removeprefix("$.")
+        old = fields.get(key) or fields.get("password") or fields.get("value") or fields.get("data") or raw
+        call_transform = dict(body_transform)
+        call_transform["context_fields"] = fields
+        return str(jsrpc_call(call_transform.get("action", CONFIG["jsrpc"]["action"]), old, call_transform))
     for transform in transforms:
         key = str(transform.get("path", "")).removeprefix("$.")
         pairs = [
@@ -222,6 +336,17 @@ def transform_form(raw: str, transforms: list[dict]) -> str:
 def apply_body(raw: str, content_type: str, transforms: list[dict]) -> str:
     if not transforms:
         return raw
+    # Burp autoDecoder sends a complete packet as application/octet-stream
+    # when the request/response packet radio is selected. Infer the body
+    # format when the wrapper omits the original Content-Type.
+    inferred_content_type = content_type or ""
+    if "octet-stream" in inferred_content_type.lower():
+        stripped = raw.lstrip()
+        if stripped.startswith(("{{", "[")):
+            inferred_content_type = "application/json"
+        elif "=" in raw and not stripped.startswith(("GET ", "POST ", "PUT ", "PATCH ", "DELETE ", "HEAD ", "OPTIONS ", "HTTP/")):
+            inferred_content_type = "application/x-www-form-urlencoded"
+    content_type = inferred_content_type
     mode = transforms[0].get("content_type", "auto")
     if mode == "json" or (mode == "auto" and "json" in content_type.lower()):
         return transform_json(raw, transforms)
@@ -235,9 +360,66 @@ def apply_body(raw: str, content_type: str, transforms: list[dict]) -> str:
     raise ValueError("Unsupported content type: " + content_type)
 
 
+def apply_packet(header_block: str, body: str, separator: str, direction: str, content_type: str) -> str:
+    """Apply query/header/cookie/body transforms while preserving the packet."""
+    lines = header_block.splitlines()
+    if lines:
+        query_transforms = transforms_for(direction, "query")
+        if query_transforms:
+            request_line = lines[0].split(" ", 2)
+            if len(request_line) >= 2:
+                request_line[1] = transform_query_target(request_line[1], query_transforms)
+                lines[0] = " ".join(request_line)
+    transformed_headers = transform_headers("\\r\\n".join(lines), direction)
+    transformed_body = apply_body(body, content_type, body_transforms(direction))
+    return rebuild_http_packet(transformed_headers, separator, transformed_body)
+
+
+def split_http_packet(raw: str) -> tuple[str, str, str] | None:
+    """Split a Burp autoDecoder raw packet into headers and body."""
+    if not raw:
+        return None
+    candidates = [raw.lstrip("\\ufeff")]
+    if "\\\\r\\\\n" in raw:
+        candidates.append(raw.replace("\\\\r\\\\n", "\\r\\n").replace("\\\\n", "\\n"))
+    for candidate in candidates:
+        for separator in ("\\r\\n\\r\\n\\r\\n\\r\\n", "\\n\\n\\n\\n", "\\r\\n\\r\\n", "\\n\\n"):
+            if separator not in candidate:
+                continue
+            header_block, body = candidate.split(separator, 1)
+            first_line = header_block.splitlines()[0].strip().upper() if header_block.splitlines() else ""
+            if first_line.startswith(("GET ", "POST ", "PUT ", "PATCH ", "DELETE ", "HEAD ", "OPTIONS ", "HTTP/")):
+                return header_block, separator, body
+    return None
+
+
+def packet_content_type(header_block: str) -> str:
+    for line in header_block.splitlines():
+        if line.lower().startswith("content-type:") and ":" in line:
+            return line.split(":", 1)[1].strip()
+    return "application/octet-stream"
+
+
+def rebuild_http_packet(header_block: str, separator: str, body: str) -> str:
+    """Return a raw packet with Content-Length synchronized to the new body."""
+    lines = header_block.splitlines()
+    body_length = len(body.encode("utf-8"))
+    updated = []
+    content_length_seen = False
+    for line in lines:
+        if line.lower().startswith("content-length:") and ":" in line:
+            updated.append("Content-Length: " + str(body_length))
+            content_length_seen = True
+        else:
+            updated.append(line)
+    if not content_length_seen:
+        updated.append("Content-Length: " + str(body_length))
+    return "\\r\\n".join(updated) + separator + body
+
+
 @app.get("/health")
 def health():
-    return jsonify({{"status": "ok", "version": CONFIG["version"], "jsrpc": CONFIG["jsrpc"]["base_url"]}})
+    return jsonify({{"status": "ok", "service": "jsra-flask", "jsrpc": CONFIG["jsrpc"]["base_url"]}})
 
 
 @app.get("/healthz")
@@ -260,15 +442,49 @@ def transform_endpoint():
 
 @app.post(CONFIG["route"])
 def autodecoder():
-    raw = request.get_data(as_text=True)
-    direction = request.args.get("direction", "request")
-    content_type = request.headers.get("X-JSRA-Content-Type", request.content_type or "application/octet-stream")
+    # Accept both Burp autoDecoder's dataBody/dataHeaders wrapper and the
+    # direct-body form.  The wrapper is intentionally unwrapped before the
+    # content-type dispatch so the same transform path is exercised either way.
+    wrapped_body = request.form.get("dataBody")
+    if wrapped_body is not None:
+        raw = wrapped_body
+        wrapped_headers = request.form.get("dataHeaders")
+        content_type = request.headers.get("X-JSRA-Content-Type", "")
+        if not content_type:
+            content_type = next((
+                line.split(":", 1)[1].strip()
+                for line in (wrapped_headers or "").splitlines()
+                if line.lower().startswith("content-type:") and ":" in line
+            ), "application/octet-stream")
+    else:
+        raw = request.get_data(as_text=True)
+        content_type = request.headers.get("X-JSRA-Content-Type", request.content_type or "application/octet-stream")
+    direction = request.form.get("requestorresponse") or request.args.get("direction")
+    if not direction:
+        direction = "response" if request.path == "/decode" else "request"
     try:
-        return Response(apply_body(raw, content_type, body_transforms(direction)), content_type="text/plain; charset=utf-8")
+        packet = split_http_packet(raw) if wrapped_body is None else None
+        if packet:
+            header_block, separator, body = packet
+            content_type = request.headers.get("X-JSRA-Content-Type", packet_content_type(header_block))
+            return Response(apply_packet(header_block, body, separator, direction, content_type), content_type="text/plain; charset=utf-8")
+        transformed_headers = transform_headers(wrapped_headers, direction) if wrapped_headers is not None else None
+        transformed = apply_body(raw, content_type, body_transforms(direction))
+        if wrapped_body is not None and wrapped_headers is not None:
+            # autoDecoder expects this exact separator when header handling is enabled.
+            return Response(transformed_headers + "\\r\\n\\r\\n\\r\\n\\r\\n" + transformed, content_type="text/plain; charset=utf-8")
+        return Response(transformed, content_type="text/plain; charset=utf-8")
     except JSRPCError as error:
         return Response("JSRA_ERROR: " + str(error), status=502, content_type="text/plain; charset=utf-8")
     except Exception as error:
         return Response("JSRA_ERROR: " + str(error), status=400, content_type="text/plain; charset=utf-8")
+
+
+# Burp autoDecoder 的“请求数据包”模式使用固定的加密/解密接口。
+# 保留 CONFIG["route"]、/autodecoder 和 dataBody/dataHeaders 以兼容旧配置。
+for alias, endpoint in (("/encode", "autodecoder_encode"), ("/decode", "autodecoder_decode"), ("/autodecoder", "autodecoder_legacy")):
+    if CONFIG["route"] != alias:
+        app.add_url_rule(alias, endpoint=endpoint, view_func=autodecoder, methods=["POST"])
 
 
 if __name__ == "__main__":
